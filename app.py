@@ -1,17 +1,17 @@
-# app.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
-from fastapi.middleware.cors import CORSMiddleware
+import io, json, os, re
 from typing import List, Optional
-import json, io, re
+
 import fitz  # PyMuPDF
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
-app = FastAPI(title="NiceDay PDF API")
+app = FastAPI()
 
-# CORS: allow your static site to call this API
+# CORS: allow your GitHub Pages origin (and fallback *)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten later to your domain(s)
+    allow_origins=["https://rishvan102.github.io", "*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,92 +21,89 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
-def _new_index_after_deletions(orig_idx: int, deleted_sorted: List[int]) -> Optional[int]:
-    """Map original page index -> new index after deletions.
-       Returns None if the page was deleted.
-    """
-    if orig_idx in set(deleted_sorted):
-        return None
-    # how many deleted pages are <= this original index?
-    shift = sum(1 for d in deleted_sorted if d <= orig_idx)
-    return orig_idx - shift
+# ---- helpers ---------------------------------------------------------------
+
+def parse_deletions(s: str, total_pages: int) -> List[int]:
+    """Return a descending, de-duplicated list of valid page indexes to delete."""
+    try:
+        arr = json.loads(s)
+        nums = sorted({int(x) for x in arr if 0 <= int(x) < total_pages}, reverse=True)
+        return nums
+    except Exception:
+        return []
+
+def index_map_after_deletes(total_pages: int, deletions_desc: List[int]):
+    """Map original index -> new index after deletions."""
+    deleted = set(deletions_desc)
+    keep = [i for i in range(total_pages) if i not in deleted]
+    return {orig: new for new, orig in enumerate(keep)}
+
+_overlay_rx = re.compile(r"overlay_(\d+)\.", re.IGNORECASE)
+
+# ---- main endpoint ---------------------------------------------------------
 
 @app.post("/api/pdf/export")
 async def export_pdf(
-    pdf: UploadFile = File(..., description="Original PDF"),
-    deletions: str = Form("[]", description="JSON array of original indices to delete"),
-    overlays: List[UploadFile] = File(default=None, description="PNG overlays named overlay_<origIndex>.png"),
+    pdf: UploadFile = File(...),
+    deletions: str = Form("[]"),
+    overlays: Optional[List[UploadFile]] = File(None),
 ):
-    # 1) Read inputs
-    try:
-        pdf_bytes = await pdf.read()
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read PDF: {e}")
+    # Read source PDF
+    src_bytes = await pdf.read()
+    doc = fitz.open(stream=src_bytes, filetype="pdf")
+    original_page_count = doc.page_count
 
-    try:
-        del_list = json.loads(deletions or "[]")
-        if not isinstance(del_list, list):
-            raise ValueError("deletions must be a JSON list")
-        # normalize: unique, ints, in-range handled later
-        deleted_sorted = sorted({int(x) for x in del_list if int(x) >= 0})
-    except Exception as e:
-        raise HTTPException(400, f"Invalid 'deletions': {e}")
+    # 1) Delete pages (indexes are from the ORIGINAL PDF)
+    del_idxs_desc = parse_deletions(deletions, original_page_count)
+    for i in del_idxs_desc:  # delete from highest to lowest
+        if 0 <= i < doc.page_count:
+            doc.delete_page(i)
 
-    # Build overlay map: originalIndex -> bytes
-    overlay_map = {}
+    # Build map: original index -> new index (after deletions)
+    idx_map = index_map_after_deletes(original_page_count, del_idxs_desc)
+
+    # 2) Burn overlays (files named overlay_<ORIGINAL_INDEX>.png)
     if overlays:
-        for up in overlays:
-            name = (up.filename or "").lower()
-            m = re.search(r"overlay_(\d+)", name)
+        for f in overlays:
+            # extract original index from filename
+            m = _overlay_rx.search(f.filename or "")
             if not m:
-                # ignore files with unexpected names
                 continue
-            idx = int(m.group(1))
-            overlay_map[idx] = await up.read()
+            orig_idx = int(m.group(1))
+            if orig_idx not in idx_map:
+                continue  # this page was deleted or invalid
 
-    # 2) Open PDF
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as e:
-        raise HTTPException(400, f"Could not open PDF: {e}")
+            new_idx = idx_map[orig_idx]
+            if not (0 <= new_idx < doc.page_count):
+                continue
 
-    # 3) Delete pages (reverse so indices remain valid)
-    for d in sorted(deleted_sorted, reverse=True):
-        if 0 <= d < doc.page_count:
-            doc.delete_page(d)
-
-    # 4) Place overlays (stretch each PNG to full page)
-    #    overlay filenames use ORIGINAL indices; map them to NEW indices
-    for orig_idx, png_bytes in overlay_map.items():
-        new_idx = _new_index_after_deletions(orig_idx, deleted_sorted)
-        if new_idx is None:
-            continue  # that original page was deleted
-        if not (0 <= new_idx < doc.page_count):
-            continue
-        try:
+            img_bytes = await f.read()
             page = doc.load_page(new_idx)
-            rect = page.rect  # full page
-            # overlay=True draws on top; keep_proportion=False stretches to full page
-            page.insert_image(rect, stream=png_bytes, keep_proportion=False, overlay=True)
-        except Exception as e:
-            # skip bad overlay but keep processing others
-            print(f"Overlay failed on page {new_idx}: {e}")
+            rect = page.rect  # full-page rect
+            # place image to cover the full page (stretched—OK because aspect matches)
+            page.insert_image(rect, stream=img_bytes, overlay=True, keep_proportion=False)
 
-    # 5) Return PDF
-    try:
-        out = doc.tobytes()
-    except Exception as e:
-        raise HTTPException(500, f"Failed to serialize PDF: {e}")
-    finally:
-        doc.close()
-
+    # 3) Save and return
+    out = io.BytesIO()
+    doc.save(out, garbage=3, deflate=True)
+    doc.close()
+    out.seek(0)
     return Response(
-        content=out,
+        content=out.getvalue(),
         media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="edited.pdf"'},
+        headers={"Content-Disposition": "attachment; filename=edited.pdf"},
     )
 
-# Optional: simple root clarifier (avoids confusing 404 on "/")
-@app.get("/")
-def root():
-    return {"message": "NiceDay PDF API. Use POST /api/pdf/export"}
+# Optional compatibility alias if your old front-end called /api/burn
+@app.post("/api/burn")
+async def burn_alias(
+    pdf: UploadFile = File(...),
+    deletions: str = Form("[]"),
+    overlays: Optional[List[UploadFile]] = File(None),
+):
+    return await export_pdf(pdf=pdf, deletions=deletions, overlays=overlays)
+
+# Local run (Render uses your start command, this helps local testing)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
