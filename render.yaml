@@ -8,6 +8,6 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: CORS_ORIGINS
-        value: "*"
+        value: 3.12.6
+      - key: PIP_ONLY_BINARY
+        value: ":all:"
